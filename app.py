@@ -1,3 +1,11 @@
+import os
+import streamlit as st
+
+# Fix for Hugging Face Spaces permission issues
+os.environ['STREAMLIT_CONFIG_DIR'] = '/tmp/.streamlit'
+os.environ['STREAMLIT_SERVER_HEADLESS'] = 'true'
+
+
 import io
 import joblib
 import numpy as np
