@@ -1,4 +1,16 @@
 venv/
+qsar_env/
+.env/
 .venv/
-_pycache_/
+__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.env
+.streamlit/
