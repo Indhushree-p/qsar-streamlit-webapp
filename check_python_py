@@ -1,0 +1,44 @@
+# Save this as check_python.py and run it with: python check_python.py
+import os
+import sys
+import subprocess
+
+print("=== Python Environment Check ===")
+print(f"Python version: {sys.version}")
+print(f"Executable: {sys.executable}")
+
+# Check common Python installation paths
+paths_to_check = [
+    "C:\\Python39\\",
+    "C:\\Python310\\", 
+    "C:\\Python311\\",
+    "C:\\Program Files\\Python39\\",
+    "C:\\Program Files\\Python310\\",
+    "C:\\Program Files\\Python311\\",
+    os.path.expanduser("~") + "\\AppData\\Local\\Programs\\Python\\Python39\\",
+    os.path.expanduser("~") + "\\AppData\\Local\\Programs\\Python\\Python310\\",
+]
+
+print("\nChecking for Python installations:")
+found = False
+for path in paths_to_check:
+    python_exe = path + "python.exe"
+    if os.path.exists(python_exe):
+        print(f"✓ Found: {python_exe}")
+        found = True
+        # Test if it can import streamlit
+        try:
+            result = subprocess.run([python_exe, "-c", "import streamlit; print('Streamlit is installed')"], 
+                                  capture_output=True, text=True, timeout=10)
+            if "Streamlit is installed" in result.stdout:
+                print("  ✓ Streamlit is installed")
+            else:
+                print("  ✗ Streamlit is NOT installed")
+        except:
+            print("  ? Could not check streamlit")
+
+if not found:
+    print("✗ No Python installations found in common locations")
+
+print("\nRecommendation: Install Python 3.9 from Microsoft Store or python.org")
+input("Press Enter to exit...")
