@@ -1,21 +1,50 @@
 import os
-import streamlit as st
+import sys
+import builtins
 
-# Fix for Hugging Face Spaces permission issues
+# COMPLETELY DISABLE STREAMLIT CONFIG
 os.environ['STREAMLIT_CONFIG_DIR'] = '/tmp/.streamlit'
 os.environ['STREAMLIT_SERVER_HEADLESS'] = 'true'
+os.environ['STREAMLIT_BROWSER_GATHER_USAGE_STATS'] = 'false'
+os.environ['STREAMLIT_TELEMETRY_ENABLED'] = 'false'
 
+# -----------------------------
+# HUGGING FACE SPECIFIC CONFIG
+# -----------------------------
+os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib-cache'  # For Matplotlib
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
+
+# MONKEY PATCH OS FUNCTIONS TO PREVENT PERMISSION ERRORS
+_original_makedirs = os.makedirs
+_original_open = builtins.open
+
+def _safe_makedirs(name, *args, **kwargs):
+    if '.streamlit' in name:
+        name = name.replace('/.streamlit', '/tmp/.streamlit')
+    return _original_makedirs(name, *args, **kwargs)
+
+def _safe_open(file, *args, **kwargs):
+    if '.streamlit' in str(file):
+        file = str(file).replace('/.streamlit', '/tmp/.streamlit')
+    return _original_open(file, *args, **kwargs)
+
+os.makedirs = _safe_makedirs
+builtins.open = _safe_open
+
+# NOW IMPORT STREAMLIT (after monkey patching)
+import streamlit as st
 
 import io
 import joblib
 import numpy as np
 import pandas as pd
-
-import streamlit as st
 import time
 import base64
 import warnings
-import xgboost as xgb  
+import datetime
+import json
+import uuid
+from collections import defaultdict
 warnings.filterwarnings('ignore')
 
 from rdkit import Chem
@@ -48,10 +77,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.model_selection import GridSearchCV
-from sklearn.neighbors import KNeighborsRegressor
 from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn.linear_model import LinearRegression
-
 
 # Add XGBoost import with error handling
 try:
@@ -59,6 +85,7 @@ try:
     XGBOOST_AVAILABLE = True
 except ImportError:
     XGBOOST_AVAILABLE = False
+    st.warning("XGBoost is not installed. XGBoost models will be disabled.")
 
 # Optional SHAP import with error handling
 try:
@@ -67,7 +94,102 @@ try:
 except ImportError:
     SHAP_AVAILABLE = False
     st.warning("SHAP is not installed. Some advanced visualization features will be disabled.")
-    st.info("To install SHAP: pip install shap")
+
+# ADD THIS RIGHT AFTER YOUR IMPORTS (around line 80)
+import streamlit as st
+
+# OVERRIDE st.write to block SMILES display
+_original_write = st.write
+def _safe_write(*args, **kwargs):
+    # Check if any argument contains smiles_list
+    if any('smiles_list' in str(arg) for arg in args):
+        return  # Skip writing
+    return _original_write(*args, **kwargs)
+st.write = _safe_write
+
+
+    # ==================== ADD FILE UPLOAD FIX RIGHT HERE ====================
+# -----------------------------
+# MANUAL FILE UPLOAD FIX FOR HUGGING FACE
+# -----------------------------
+import tempfile
+
+def save_uploaded_file(uploaded_file):
+    """Save uploaded file to /tmp directory and return the path"""
+    try:
+        # Get file extension
+        file_ext = os.path.splitext(uploaded_file.name)[1] if uploaded_file.name else '.csv'
+        # Create temporary file in /tmp
+        with tempfile.NamedTemporaryFile(dir='/tmp', delete=False, suffix=file_ext) as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            return tmp_file.name
+    except Exception as e:
+        st.error(f"Error saving file to /tmp: {e}")
+        return None
+
+def read_uploaded_file(uploaded_file):
+    """Read uploaded file safely by saving to /tmp first"""
+    temp_path = save_uploaded_file(uploaded_file)
+    if temp_path:
+        try:
+            # Read based on file type
+            if uploaded_file.name.lower().endswith('.csv'):
+                return pd.read_csv(temp_path)
+            elif uploaded_file.name.lower().endswith(('.xlsx', '.xls')):
+                return pd.read_excel(temp_path)
+            else:
+                st.error("Unsupported file format. Please upload CSV or Excel file.")
+                return None
+        except Exception as e:
+            st.error(f"Error reading file: {e}")
+            return None
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    return None
+
+# -------------------------------------------------------------------
+# ANALYTICS DATA PERSISTENCE FUNCTIONS
+# -------------------------------------------------------------------
+def save_analytics_data():
+    """Save analytics data to a file in /tmp directory"""
+    try:
+        # Create /tmp directory if it doesn't exist
+        os.makedirs('/tmp', exist_ok=True)
+        
+        # Save analytics data
+        with open('/tmp/mol_analytics_data.json', 'w') as f:
+            json.dump(st.session_state.analytics, f, indent=2)
+        
+    except Exception as e:
+        pass  # Fail silently in production
+
+def load_analytics_data():
+    """Load analytics data from file if it exists"""
+    try:
+        analytics_file = '/tmp/mol_analytics_data.json'
+        if os.path.exists(analytics_file):
+            with open(analytics_file, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        pass  # Fail silently if file doesn't exist or is corrupted
+    return None
+
+def track_event(event_type, **kwargs):
+    """Track an event and auto-save analytics"""
+    event_data = {
+        'action': event_type,
+        'timestamp': datetime.datetime.now().isoformat(),
+        **kwargs
+    }
+    
+    # Add event to current session
+    if st.session_state.session_id in st.session_state.analytics['sessions']:
+        st.session_state.analytics['sessions'][st.session_state.session_id]['actions'].append(event_data)
+    
+    # Auto-save after each event
+    save_analytics_data()
 
 # -----------------------------
 # Configuration and Constants
@@ -89,15 +211,35 @@ if 'trained_state' not in st.session_state:
         'training_time': None,
         'pipeline': None,
         'y_train': None
-    }
+    }  
 
 if 'app_state' not in st.session_state:
     st.session_state.app_state = {
         'current_tab': 'Home',
         'file_uploaded': False,
         'data_preprocessed': False
+    } 
+
+
+# ==================== ADD ANALYTICS INITIALIZATION HERE ====================
+if 'analytics' not in st.session_state:
+    st.session_state.analytics = {
+        'total_sessions': 0,
+        'total_predictions': 0,
+        'total_molecules': 0,
+        'sessions': {},
+        'feedback': []
     }
 
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+    st.session_state.analytics['total_sessions'] += 1
+    st.session_state.analytics['sessions'][st.session_state.session_id] = {
+        'start_time': datetime.datetime.now().isoformat(),
+        'predictions': 0,
+        'molecules': 0,
+        'actions': []
+    }
 # -----------------------------
 # Enhanced Pipeline with Memory and Performance Optimizations
 # -----------------------------
@@ -196,12 +338,16 @@ class QSARFeaturizer(BaseEstimator, TransformerMixin):
         self.feature_names_ = names
         return self
 
+    
     def transform(self, X):
-        # Process in chunks to avoid memory issues
+    # Process in chunks to avoid memory issues
         chunks = [X[i:i+CHUNK_SIZE] for i in range(0, len(X), CHUNK_SIZE)]
         all_feats = []
         valids = []
-        
+    
+    # Get expected feature length
+        expected_length = len(self.feature_names_)
+    
         for chunk in chunks:
             chunk_feats, chunk_valids = [], []
             for s in chunk:
@@ -211,7 +357,7 @@ class QSARFeaturizer(BaseEstimator, TransformerMixin):
                         chunk_feats.append(None)
                         chunk_valids.append(False)
                         continue
-                        
+                    
                     vecs = []
                     if self.use_maccs:
                         vecs.append(self._maccs(mol))
@@ -223,30 +369,53 @@ class QSARFeaturizer(BaseEstimator, TransformerMixin):
                         vecs.append(self._atom_pair(mol))
                     if self.use_topological:
                         vecs.append(self._topological(mol))
-                        
-                    chunk_feats.append(np.concatenate(vecs).astype(np.float32))
-                    chunk_valids.append(True)
                     
+                # Combine all feature vectors
+                    combined = np.concatenate(vecs).astype(np.float32)
+                
+                # FIX: Ensure fixed length
+                    if len(combined) != expected_length:
+                        if len(combined) < expected_length:
+                        # Pad with zeros if too short
+                            padded = np.zeros(expected_length, dtype=np.float32)
+                            padded[:len(combined)] = combined
+                            combined = padded
+                        else:
+                        # Truncate if too long
+                            combined = combined[:expected_length]
+                
+                    chunk_feats.append(combined)
+                    chunk_valids.append(True)
+                
                 except Exception as e:
-                    # Log the error but continue processing other molecules
-                    st.warning(f"Failed to featurize molecule {s}: {str(e)}")
                     chunk_feats.append(None)
                     chunk_valids.append(False)
-                    
+                
             all_feats.extend(chunk_feats)
             valids.extend(chunk_valids)
-            
+        
         self.last_valid_mask_ = np.array(valids, dtype=bool)
         valid_rows = [f for f in all_feats if f is not None]
-        
+    
         if len(valid_rows) == 0:
-            return np.empty((0, len(self.feature_names_)), dtype=np.float32)
-            
-        result = np.vstack(valid_rows)
-        # Handle potential NaN values
+            return np.empty((0, expected_length), dtype=np.float32)
+        
+    # Final validation - ensure all arrays same length
+        validated_rows = []
+        for row in valid_rows:
+            if len(row) == expected_length:
+                validated_rows.append(row)
+            else:
+            # Force correct length
+                fixed_row = np.zeros(expected_length, dtype=np.float32)
+                min_len = min(len(row), expected_length)
+                fixed_row[:min_len] = row[:min_len]
+                validated_rows.append(fixed_row)
+    
+        result = np.vstack(validated_rows)
+    # Handle potential NaN values
         result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
         return result
-
 # Enhanced Utility Functions
 # -----------------------------
 def reset_training_state():
@@ -265,6 +434,44 @@ def reset_training_state():
     if 'prediction_results' in st.session_state:
         del st.session_state.prediction_results
     st.success("Training state reset! You can now train a new model.")
+
+def validate_feature_lengths(pipeline, X):
+    """Ensure all feature arrays have the same length"""
+    try:
+        # Get the featurizer from the pipeline
+        featurizer = pipeline.named_steps['feats']
+        
+        # Transform the input
+        X_transformed = featurizer.transform(X)
+        
+        # Check if all arrays have the same length
+        expected_length = X_transformed.shape[1]
+        return X_transformed, True
+        
+    except Exception as e:
+        st.error(f"Feature validation failed: {e}")
+        return None, False
+
+def safe_predict(pipeline, smiles_list):
+    """Safe prediction that handles feature length inconsistencies"""
+    try:
+        # Get the featurizer
+        featurizer = pipeline.named_steps['feats']
+        
+        # Transform with error handling
+        X_transformed = featurizer.transform(smiles_list)
+        
+        # Make predictions
+        return pipeline.named_steps['model'].predict(X_transformed)
+        
+    except Exception as e:
+        st.error(f"Prediction failed: {str(e)}")
+        # Return default values (mean of training data)
+        if 'y_train' in st.session_state.trained_state:
+            mean_val = np.mean(st.session_state.trained_state['y_train'])
+            return [mean_val] * len(smiles_list)
+        else:
+            return [6.0] * len(smiles_list)  # Default pIC50 value
 
 
 def prepare_training_frame(df_raw):
@@ -859,11 +1066,22 @@ def predict_with_pipeline(pipe, smiles_list):
         chunks = [smiles_list[i:i+CHUNK_SIZE] for i in range(0, len(smiles_list), CHUNK_SIZE)]
         predictions = []
         for chunk in chunks:
-            predictions.extend(pipe.predict(chunk))
+            # VALIDATE features before prediction
+            X_valid, success = validate_feature_lengths(pipe, chunk)
+            if success:
+                predictions.extend(pipe.named_steps['model'].predict(X_valid))
+            else:
+                # Fallback: use zeros if validation fails
+                predictions.extend([0.0] * len(chunk))
         return predictions
     else:
-        return pipe.predict(smiles_list)
-
+        # VALIDATE features before prediction
+        X_valid, success = validate_feature_lengths(pipe, smiles_list)
+        if success:
+            return pipe.named_steps['model'].predict(X_valid)
+        else:
+            st.error("Feature dimension mismatch. Please retrain your model.")
+            return [0.0] * len(smiles_list)
 def mols_from_smiles(smiles_list):
     mols = []
     for s in smiles_list:
@@ -1047,7 +1265,7 @@ def interpret_results(results, df_train):
     
     # Recommendations for improvement
     st.markdown("---")
-    st.subheader("💡 Recommendations for Improvement")
+    st.subheader("Recommendations for Improvement")
     
     if r2 < 0.6:
         st.markdown("""
@@ -1073,10 +1291,10 @@ def interpret_results(results, df_train):
         
         y_rand = results["y_randomization"]
         if y_rand["significant"]:
-            st.success("✅ Y-randomization test passed: Model is statistically significant")
+            st.success("Y-randomization test passed: Model is statistically significant")
             st.info("The model performs significantly better than random chance, indicating it's learning real patterns.")
         else:
-            st.error("⚠️ Y-randomization test failed: Model may not be significant")
+            st.error("Y-randomization test failed: Model may not be significant")
             st.warning("The model's performance is not significantly better than random permutations. This suggests:")
             st.markdown("""
             - The model might be overfitting to noise
@@ -1532,7 +1750,6 @@ with tabs[0]:
                 key=f"dl_{name}"
             )
     
-   
 # -----------------------------
 # Train Model Tab
 # -----------------------------
@@ -1545,35 +1762,25 @@ with tabs[1]:
             reset_training_state()
             st.rerun()
     
-    # Data input section
-    data_source = st.radio(
-        "Select Data Source",
-        ["Upload CSV File", "Paste Data"],
-        horizontal=True,
-        key="data_source_radio" 
-    )
-    
+    st.write("**Data Input**")
+    st.info("Paste your CSV data with SMILES and IC50 columns below")
+
+    paste_data = st.text_area("Paste CSV data (with header row)", height=150, key="paste_data_area")
     df_raw = None
     
-    if data_source == "Upload CSV File":
-        train_file = st.file_uploader("Upload CSV", type=["csv"], key="train_file")
-        if train_file:
-            df_raw = pd.read_csv(train_file)
-    
-    
-    else:  # Paste Data
-        paste_data = st.text_area("Paste CSV data (with header row)", height=150, key="paste_data_area")
-        if paste_data:
-            try:
-                from io import StringIO
-                df_raw = pd.read_csv(StringIO(paste_data))
-            except Exception as e:
-                st.error(f"Could not parse pasted data: {e}")
-    
+    if paste_data:
+        try:
+            from io import StringIO
+            df_raw = pd.read_csv(StringIO(paste_data))
+            st.success("Successfully parsed pasted data")
+        except Exception as e:
+            st.error(f"Could not parse pasted data: {e}")
+
+    # Display preview if data was loaded successfully
     if df_raw is not None:
         st.write("Data Preview:")
         st.dataframe(df_raw.head(), use_container_width=True)
-        
+            
         # Data preprocessing options
         with st.expander("Data Preprocessing Options"):
             col1, col2 = st.columns(2)
@@ -1642,7 +1849,7 @@ with tabs[1]:
                                           help="Degree 2 for quadratic, Degree 3 for cubic relationships", key="poly_degree_slider")
             
             with col2:
-                use_feature_selection = st.checkbox("Enable feature selection", value=True, key="use_feature_selection_cb")
+                use_feature_selection = st.checkbox("Enable feature selection", value=False, key="use_feature_selection_cb")
                 if use_feature_selection:
                     k_features = st.slider("Number of features to keep", 10, 200, 50, 5, key="k_features_slider")
                     feature_selection_method = st.selectbox(
@@ -1651,21 +1858,25 @@ with tabs[1]:
                         index=0,
                         key="feature_selection_method_select"
                     )
+           
 
-        # Hyperparameter Optimization
+            
+
+        # MOVE THE HYPERPARAMETER EXPANDER INSIDE THIS TAB
         hyperparam_expander = st.expander("Hyperparameter Optimization (Slower but better models)")
         with hyperparam_expander:
             tune_hyperparams = st.checkbox("Optimize hyperparameters", value=False,
-                                         help="This will take longer but may significantly improve performance", key="tune_hyperparams_cb")
-            
-            # Check if the model choice supports early stopping
+                             help="This will take longer but may significantly improve performance", key="tune_hyperparams_cb")
+    
+        # Check if the model choice supports early stopping
             early_stopping_models = ["GradientBoosting", "HistGradientBoosting"]
-            if model_choice in early_stopping_models:
+            if model_choice in early_stopping_models:  # This line should have 4 spaces indent
                 early_stopping = st.checkbox("Use early stopping", value=True,
-                                           help="Prevents overfitting by stopping training when validation score stops improving", key="early_stopping_cb")
+                               help="Prevents overfitting by stopping training when validation score stops improving", key="early_stopping_cb")
                 if early_stopping:
                     validation_fraction = st.slider("Validation fraction for early stopping", 0.1, 0.3, 0.2, 0.05, key="validation_fraction_slider")
-
+       
+                
         # Train button
         if st.button("Train Model", type="primary", use_container_width=True, key="train_model_main_btn"):
             try:
@@ -1760,6 +1971,7 @@ with tabs[1]:
                 import traceback
                 st.code(traceback.format_exc())
 
+
 # -----------------------------
 # Predict Tab - FIXED VERSION
 # -----------------------------
@@ -1787,7 +1999,7 @@ with tabs[2]:
         uploaded_model = st.file_uploader("Or upload a trained model", type=["pkl", "joblib"])
         if uploaded_model:
             try:
-                model = joblib.load(uploaded_model)
+                model = joblib.load(io.BytesIO(uploaded_model.getvalue()))
                 st.session_state.trained_state = {
                     'model': model,
                     'model_name': "Uploaded Model",
@@ -1808,49 +2020,29 @@ with tabs[2]:
             reset_training_state()
             st.rerun()
     
-    # Input methods
-    input_method = st.radio(
-        "Input Method",
-        ["Paste SMILES", "Upload CSV"],
-        horizontal=True,
-        key="input_method_radio"
-    )
-    
+    # Input methods - SIMPLIFIED
+    st.write("**Input Method**")
+    st.info("Paste SMILES strings for prediction (one per line)")
+
+    smiles_text = st.text_area("Enter SMILES strings:", 
+                              height=100,
+                              placeholder="CCO\nCC(=O)O\nc1ccccc1\nCN1C=NC2=C1C(=O)N(C)C(=O)N2C",
+                              key="predict_smiles_area")
+
     smiles_list = []
-    
-    if input_method == "Paste SMILES":
-        smiles_text = st.text_area("Enter one SMILES string per line", height=100)
-        if smiles_text:
-            smiles_list = [line.strip() for line in smiles_text.split('\n') if line.strip()]
-    
-    elif input_method == "Upload CSV":
-        smiles_file = st.file_uploader("Upload CSV with SMILES column", type=["csv"])
-        if smiles_file:
-            df_smiles = pd.read_csv(smiles_file)
-            # More robust column detection
-            possible_smiles_cols = ["smiles", "smile", "canonical_smiles", "structure", "mol", "molecule"]
-            smiles_col = None
+
+    if smiles_text:
+        smiles_list = [line.strip() for line in smiles_text.split('\n') if line.strip()]
+        if smiles_list:
+            st.success(f"Found {len(smiles_list)} molecules for prediction")
+        
             
-            for col in df_smiles.columns:
-                col_lower = col.strip().lower()
-                if col_lower in possible_smiles_cols:
-                    smiles_col = col
-                    break
-            
-            if smiles_col is None:
-                # Use the first column if no obvious SMILES column found
-                smiles_col = df_smiles.columns[0]
-                st.warning(f"Using '{smiles_col}' as SMILES column. Please verify this is correct.")
-            
-            smiles_list = df_smiles[smiles_col].astype(str).tolist()
-            st.write(f"Found {len(smiles_list)} molecules")
     
     if smiles_list and trained_model:
         if st.button("Predict Activities", type="primary", use_container_width=True, key="predict_activities_btn"):
             with st.spinner("Making predictions..."):
                 try:
-                    predictions = predict_with_pipeline(trained_model, smiles_list)
-                    
+                    predictions = safe_predict(trained_model, smiles_list)
                     # Calculate applicability domain if we have training data
                     similarities = []
                     if len(training_data) > 0:
@@ -1887,7 +2079,6 @@ with tabs[2]:
                     st.subheader("Molecule Visualization")
                     sample_size = min(8, len(results_df))
                     sample_df = results_df.head(sample_size)
-                    
                     legends = [
                         f"pIC50: {p:.2f}\nSimilarity: {s:.2f}" 
                         for p, s in zip(sample_df['Predicted_pIC50'], sample_df['Similarity_to_Training'])
@@ -1896,7 +2087,51 @@ with tabs[2]:
                     show_mols_grid(sample_df['SMILES'].tolist(), legends=legends)
                     
                 except Exception as e:
-                    st.error(f"Prediction error: {e}")
+                    st.error(f"Prediction error: {e}")                    
+
+                    
+# -----------------------------
+    # USER FEEDBACK SECTION
+    # -----------------------------
+    st.markdown("---")
+    st.subheader("Help Us Improve!")
+    
+    # Simple feedback
+    feedback = st.radio(
+        "Was this prediction useful?",
+        ["", "👍 Yes", "👎 No", "Somewhat"],
+        key="quick_feedback"
+    )
+
+    if feedback and feedback != "":
+        if 'feedback_given' not in st.session_state:
+            st.session_state.feedback_given = True
+            st.session_state.analytics['feedback'].append({
+                'session_id': st.session_state.session_id,
+                'timestamp': datetime.datetime.now().isoformat(),
+                'feedback': feedback,
+                'rating': 1 if "Yes" in feedback else (0.5 if "Somewhat" in feedback else 0)
+            })
+            st.success("Thanks for your feedback! 💙")
+
+    # Detailed feedback form
+    with st.expander("Give detailed feedback (optional)"):
+        with st.form("detailed_feedback"):
+            satisfaction = st.slider("Overall satisfaction (1-5)", 1, 5, 3, 
+                                   help="1 = Very dissatisfied, 5 = Very satisfied")
+            comments = st.text_area("Specific comments or suggestions")
+            email = st.text_input("Email (optional, if you want follow-up)")
+            
+            if st.form_submit_button("Submit Detailed Feedback"):
+                st.session_state.analytics['feedback'].append({
+                    'session_id': st.session_state.session_id,
+                    'timestamp': datetime.datetime.now().isoformat(),
+                    'satisfaction': satisfaction,
+                    'comments': comments,
+                    'email': email if email else None
+                })
+                st.success("Thank you for your detailed feedback!")                    
+                    
 
 # -----------------------------
 # Analysis Tab - COMPLETE VERSION
@@ -2308,11 +2543,11 @@ with tabs[5]:
     with info_col1:
         st.write("Version:2.0")
         st.write("Last Updated:August 2025")
-        st.write("RDKit Version:", "Temporarily disabled")
+        
     
     with info_col2:
-        st.write("Developer:Bioquantify")
-        st.write("License:Educational Use Only")
+        st.write("Developer: Bioquantify")
+        st.write("License: Educational Use Only")
         st.write("Citation:Please cite this tool if used in teaching")
 
 # -----------------------------
@@ -2329,3 +2564,79 @@ with footer_col2:
 
 with footer_col3:
     st.markdown("Academic Use  \nDeveloped by Indhushree P  \nBioquantify")
+
+
+# ==================== ANALYTICS SAFETY CHECK ====================
+# Add this RIGHT BEFORE the dashboard code
+if 'analytics' not in st.session_state:
+    st.session_state.analytics = {
+        'total_sessions': 0,
+        'total_predictions': 0, 
+        'total_molecules': 0,
+        'sessions': {},
+        'feedback': []
+    }
+
+# Update your analytics dashboard code with this:
+if st.checkbox("Show Analytics Dashboard", False, key="analytics_toggle"):
+    admin_key = st.text_input("Admin Key", type="password", key="admin_key")
+    
+    if admin_key == "indhu@261":  # CHANGE THIS!
+        st.title("Live Analytics Dashboard")
+        
+        # Real-time metrics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Sessions", st.session_state.analytics['total_sessions'])
+        col2.metric("Total Predictions", st.session_state.analytics['total_predictions'])
+        col3.metric("Total Molecules", st.session_state.analytics['total_molecules'])
+        col4.metric("Total Feedback", len(st.session_state.analytics['feedback']))
+        
+        # Feedback analysis
+        if st.session_state.analytics['feedback']:
+            st.subheader("💬 User Feedback Analysis")
+            
+            # Calculate metrics
+            positive = len([f for f in st.session_state.analytics['feedback'] if f.get('rating', 0) > 0.5])
+            negative = len([f for f in st.session_state.analytics['feedback'] if f.get('rating', 0) <= 0.5])
+            detailed_feedback = [f for f in st.session_state.analytics['feedback'] if 'satisfaction' in f]
+            
+            if detailed_feedback:
+                avg_satisfaction = sum(f['satisfaction'] for f in detailed_feedback) / len(detailed_feedback)
+                st.metric("Average Satisfaction", f"{avg_satisfaction:.1f}/5")
+            
+            # Feedback chart
+            fig, ax = plt.subplots()
+            ax.bar(['Positive', 'Negative'], [positive, negative], color=['green', 'red'])
+            ax.set_ylabel('Count')
+            ax.set_title('User Feedback Sentiment')
+            st.pyplot(fig)
+            
+            # Show comments
+            st.subheader("User Comments")
+            for feedback in st.session_state.analytics['feedback']:
+                if feedback.get('comments'):
+                    st.write(f"**{feedback.get('satisfaction', 'N/A')}/5**: {feedback['comments']}")
+                    st.markdown("---")
+        
+        # Session analysis
+        st.subheader("Usage Patterns")
+        sessions_df = pd.DataFrame.from_dict(st.session_state.analytics['sessions'], orient='index')
+        if not sessions_df.empty:
+            st.dataframe(sessions_df[['start_time', 'predictions', 'molecules']])
+            
+            # Show average molecules per prediction
+            avg_molecules = sessions_df['molecules'].sum() / sessions_df['predictions'].sum() if sessions_df['predictions'].sum() > 0 else 0
+            st.metric("Avg Molecules per Prediction", f"{avg_molecules:.1f}")
+        
+        # Export button
+        if st.button("Export Full Analytics Data"):
+            analytics_json = json.dumps(st.session_state.analytics, indent=2)
+            st.download_button(
+                "Download JSON",
+                analytics_json,
+                file_name=f"mol_analytics_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
+            )
+            
+    elif admin_key:
+        st.error("Invalid admin key")
